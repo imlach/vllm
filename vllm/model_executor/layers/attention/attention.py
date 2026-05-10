@@ -619,7 +619,12 @@ direct_register_custom_op(
 
 def get_attention_context(
     layer_name: str,
-) -> tuple[Any, "Attention | MLAAttention", torch.Tensor, torch.Tensor]:
+) -> tuple[
+    Any,
+    "Attention | MLAAttention | None",
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Extract attention context for a given layer.
 
     This helper function extracts the attention metadata, attention layer
@@ -632,22 +637,33 @@ def get_attention_context(
         A tuple containing:
         - attn_metadata: Attention metadata for this specific layer, or None if
             no metadata available
-        - attn_layer: The attention layer instance (Attention or MLAAttention)
-        - kv_cache: The KV cache tensor for current forward pass
-        - slot_mapping: The slot mapping for this specific layer
-
-        Note: attn_metadata may be None, but attn_layer and kv_cache are always
-        extracted from the forward context.
+        - attn_layer: The attention layer instance (Attention or MLAAttention),
+            or None if the layer is not owned by the current PP rank
+        - kv_cache: The KV cache tensor for current forward pass, or None when
+            attn_layer is None
+        - slot_mapping: The slot mapping for this specific layer, or None when
+            attn_layer is None
     """
     forward_context: ForwardContext = get_forward_context()
+    # PP-rank-aware: when a compiled graph captures the global model
+    # (e.g. during the speculative warmup pass, which iterates every layer
+    # on every rank), the registered split ops `unified_kv_cache_update`
+    # and `unified_attention_with_output` are invoked for layers not owned
+    # by the current rank. Those layers have no entry in `no_compile_layers`
+    # (a rank-local dict). Short-circuit here so the consumers can detect
+    # and skip the call site, instead of KeyError'ing inside the indexer.
+    if layer_name not in forward_context.no_compile_layers:
+        return None, None, None, None
     attn_metadata_raw = forward_context.attn_metadata
     attn_metadata: AttentionMetadata
     if isinstance(attn_metadata_raw, dict):
-        attn_metadata = attn_metadata_raw[layer_name]
+        attn_metadata = attn_metadata_raw.get(layer_name)
     elif isinstance(attn_metadata_raw, list):
         # list[dict[str, AttentionMetadata]]: used in speculative decoding
         # where [0] is the base-model (non-speculative) metadata dict.
-        attn_metadata = attn_metadata_raw[0][layer_name]
+        attn_metadata = (
+            attn_metadata_raw[0].get(layer_name) if attn_metadata_raw else None
+        )
     else:
         attn_metadata = attn_metadata_raw
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
@@ -671,6 +687,12 @@ def unified_kv_cache_update(
     """
     layer_name = _resolve_layer_name(layer_name)
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if attn_layer is None:
+        # Layer not on this PP rank — get_attention_context returned the
+        # all-None sentinel. Return a tensor with the same shape and dtype
+        # as the fake_impl so torch.compile's data-dependency tracking
+        # holds. kv_cache is None here, so dtype/device come from key.
+        return torch.empty(0, device=key.device, dtype=key.dtype)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -719,6 +741,11 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    if self is None:
+        # Layer not on this PP rank. `output` is pre-allocated by the
+        # caller and zero-initialised by the upstream graph; leaving it
+        # unmodified is the correct contribution from a non-owning rank.
+        return
 
     self.impl.forward(
         self,
