@@ -2299,8 +2299,14 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                # `self.drafter` is only initialized on the last PP rank (see
+                # __init__: `if self.speculative_config and
+                # get_pp_group().is_last_rank`), but `self.speculative_config`
+                # is shared across every rank. Use getattr so non-last ranks
+                # take the else branch instead of AttributeError'ing.
+                drafter = getattr(self, "drafter", None)
+                if isinstance(drafter, (EagleProposer, DFlashProposer)):
+                    if drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
