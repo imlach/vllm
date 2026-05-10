@@ -2334,16 +2334,24 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
+                # `self.drafter` is only initialized on the last PP rank (see
+                # __init__: `if self.speculative_config and
+                # get_pp_group().is_last_rank`), but `self.speculative_config`
+                # is shared across every rank. Use getattr so non-last ranks
+                # take the else branch instead of AttributeError'ing.
+                drafter = getattr(self, "drafter", None)
                 if isinstance(
-                    self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
+                    drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
                 ):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                    if drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
-                self.drafter.set_per_group_block_table(
+            # Same getattr guard as above — non-last PP ranks have no drafter.
+            drafter = getattr(self, "drafter", None)
+            if self.speculative_config and isinstance(drafter, Gemma4Proposer):
+                drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
 
