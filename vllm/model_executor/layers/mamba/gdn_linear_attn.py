@@ -766,7 +766,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             return
 
         assert isinstance(attn_metadata_raw, dict)
-        attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
+        # PP-rank-aware: a compiled graph capturing the global model invokes
+        # this op for layers whose GDN metadata was not built on the current
+        # PP rank (partial attn_metadata dict). Tolerate the miss and
+        # contribute nothing — core_attn_out is pre-allocated by the caller
+        # and a non-owning rank's output for this layer is never consumed.
+        # Same fix class as get_attention_context's `.get()` in attention.py.
+        attn_metadata = attn_metadata_raw.get(self.prefix)
+        if attn_metadata is None:
+            return
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         if (
@@ -1077,6 +1085,13 @@ def gdn_attention_core(
     """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
+    # PP-rank-aware: when a compiled graph captures the global model, this
+    # registered split op is invoked for layers not owned by the current
+    # PP rank. Those layers have no entry in `no_compile_layers` (a
+    # rank-local dict). Short-circuit instead of KeyError'ing inside the
+    # indexer — same fix class as get_attention_context in attention.py.
+    if layer_name not in forward_context.no_compile_layers:
+        return
     self = forward_context.no_compile_layers[layer_name]
     self._forward_core(
         mixed_qkv=mixed_qkv,
